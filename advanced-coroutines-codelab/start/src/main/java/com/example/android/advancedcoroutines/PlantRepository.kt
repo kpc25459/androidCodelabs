@@ -16,85 +16,90 @@
 
 package com.example.android.advancedcoroutines
 
+import androidx.annotation.AnyThread
+import androidx.lifecycle.map
+import com.example.android.advancedcoroutines.util.CacheOnSuccess
+import com.example.android.advancedcoroutines.utils.ComparablePair
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.withContext
 
-/**
- * Repository module for handling data operations.
- *
- * This PlantRepository exposes two UI-observable database queries [plants] and
- * [getPlantsWithGrowZone].
- *
- * To update the plants cache, call [tryUpdateRecentPlantsForGrowZoneCache] or
- * [tryUpdateRecentPlantsCache].
- */
 class PlantRepository private constructor(
     private val plantDao: PlantDao,
     private val plantService: NetworkService,
     private val defaultDispatcher: CoroutineDispatcher = Dispatchers.Default
 ) {
 
-    /**
-     * Fetch a list of [Plant]s from the database.
-     * Returns a LiveData-wrapped List of Plants.
-     */
+    private var plantsListSortOrderCache = CacheOnSuccess(onErrorFallback = { listOf<String>() }) {
+        plantService.customPlantSortOrder()
+    }
+
     val plants = plantDao.getPlants()
 
-    /**
-     * Fetch a list of [Plant]s from the database that matches a given [GrowZone].
-     * Returns a LiveData-wrapped List of Plants.
-     */
     fun getPlantsWithGrowZone(growZone: GrowZone) =
         plantDao.getPlantsWithGrowZoneNumber(growZone.number)
 
-    /**
-     * Returns true if we should make a network request.
-     */
+    fun getPlantsWithGrowZoneFlow(growZoneNumber: GrowZone): Flow<List<Plant>> {
+        return plantDao.getPlantsWithGrowZoneNumberFlow(growZoneNumber.number)
+            .map { plantList ->
+                val sortOrderFromNetwork = plantsListSortOrderCache.getOrAwait()
+                val nextValue = plantList.applyMainSafeSort(sortOrderFromNetwork)
+                nextValue
+            }
+    }
+
     private fun shouldUpdatePlantsCache(): Boolean {
-        // suspending function, so you can e.g. check the status of the database here
         return true
     }
 
-    /**
-     * Update the plants cache.
-     *
-     * This function may decide to avoid making a network requests on every call based on a
-     * cache-invalidation policy.
-     */
     suspend fun tryUpdateRecentPlantsCache() {
         if (shouldUpdatePlantsCache()) fetchRecentPlants()
     }
 
-    /**
-     * Update the plants cache for a specific grow zone.
-     *
-     * This function may decide to avoid making a network requests on every call based on a
-     * cache-invalidation policy.
-     */
     suspend fun tryUpdateRecentPlantsForGrowZoneCache(growZoneNumber: GrowZone) {
         if (shouldUpdatePlantsCache()) fetchPlantsForGrowZone(growZoneNumber)
     }
 
-    /**
-     * Fetch a new list of plants from the network, and append them to [plantDao]
-     */
     private suspend fun fetchRecentPlants() {
         val plants = plantService.allPlants()
         plantDao.insertAll(plants)
     }
 
-    /**
-     * Fetch a list of plants for a grow zone from the network, and append them to [plantDao]
-     */
     private suspend fun fetchPlantsForGrowZone(growZone: GrowZone) {
         val plants = plantService.plantsByGrowZone(growZone)
         plantDao.insertAll(plants)
     }
 
-    companion object {
+    private val customSortFlow = plantsListSortOrderCache::getOrAwait.asFlow()
 
-        // For Singleton instantiation
-        @Volatile private var instance: PlantRepository? = null
+    private fun List<Plant>.applySort(customSortOrder: List<String>): List<Plant> {
+        return sortedBy { plant ->
+            val positionForItem = customSortOrder.indexOf(plant.plantId).let { order ->
+                if (order > -1) order else Int.MAX_VALUE
+            }
+            ComparablePair(positionForItem, plant.name)
+        }
+    }
+
+    @AnyThread
+    private suspend fun List<Plant>.applyMainSafeSort(customSortOrder: List<String>) =
+        withContext(defaultDispatcher) {
+            this@applyMainSafeSort.applySort(customSortOrder)
+        }
+
+    val plantsFlow: Flow<List<Plant>>
+        get() = plantDao.getPlantsFlow()
+
+            .combine(customSortFlow) { plants, sortOrder ->
+                plants.applySort(sortOrder)
+            }
+            .flowOn(defaultDispatcher)
+            .conflate()
+
+    companion object {
+        @Volatile
+        private var instance: PlantRepository? = null
 
         fun getInstance(plantDao: PlantDao, plantService: NetworkService) =
             instance ?: synchronized(this) {
